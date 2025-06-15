@@ -266,6 +266,8 @@ def main():
                        help="Sample interval in milliseconds (default: 1000)")
     parser.add_argument("-v", "--verbose", action="store_true",
                        help="Enable verbose output")
+    parser.add_argument("--show-warnings", action="store_true",
+                       help="Show kernel header compilation warnings")
     
     args = parser.parse_args()
     
@@ -284,7 +286,16 @@ def main():
     
     try:
         # Initialize BPF
-        bpf = BPF(text=BPF_PROGRAM)
+        import contextlib
+        import io
+        
+        if args.show_warnings:
+            # Show all warnings
+            bpf = BPF(text=BPF_PROGRAM)
+        else:
+            # Suppress kernel header warnings during compilation
+            with contextlib.redirect_stderr(io.StringIO()):
+                bpf = BPF(text=BPF_PROGRAM)
         
         # Set target PID in config map
         config_map = bpf.get_table("config")
