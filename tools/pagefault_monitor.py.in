@@ -203,6 +203,8 @@ def print_statistics(bpf, clear_screen=True):
     # Get stats from BPF map
     fault_stats_map = bpf.get_table("fault_stats")
     
+    # Collect entries and calculate metrics
+    entries = []
     for key, value in fault_stats_map.items():
         if value.major_fault_count == 0 and value.minor_fault_count == 0:
             continue
@@ -220,12 +222,31 @@ def print_statistics(bpf, clear_screen=True):
         max_time_ms = value.max_fault_time_ns / 1e6
         min_time_us = value.min_fault_time_ns / 1e3
         
+        entries.append({
+            'pid': pid,
+            'tid': tid,
+            'comm': comm,
+            'major_count': major_count,
+            'minor_count': minor_count,
+            'total_time_ms': total_time_ms_val,
+            'avg_time_ms': avg_time_ms,
+            'max_time_ms': max_time_ms,
+            'min_time_us': min_time_us
+        })
+        
         total_major += major_count
         total_minor += minor_count
         total_time_ms += total_time_ms_val
-        
-        print(f"{pid:>8} {tid:>8} {comm:<16} {major_count:>8} {minor_count:>8} "
-              f"{total_time_ms_val:>12.2f} {avg_time_ms:>10.3f} {max_time_ms:>10.3f} {min_time_us:>10.1f}")
+    
+    # Sort by total_time_ms in descending order
+    entries.sort(key=lambda x: x['total_time_ms'], reverse=True)
+    
+    # Print sorted entries
+    for entry in entries:
+        print(f"{entry['pid']:>8} {entry['tid']:>8} {entry['comm']:<16} "
+              f"{entry['major_count']:>8} {entry['minor_count']:>8} "
+              f"{entry['total_time_ms']:>12.2f} {entry['avg_time_ms']:>10.3f} "
+              f"{entry['max_time_ms']:>10.3f} {entry['min_time_us']:>10.1f}")
     
     print("-" * 100)
     print(f"TOTAL: Major={total_major} Minor={total_minor} Time={total_time_ms:.2f}ms")
