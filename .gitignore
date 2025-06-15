@@ -1,0 +1,129 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+.build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+*.cmake
+!CMakeLists.txt
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Compiled binaries
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.out
+*.app
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel module files
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# eBPF specific
+*.bpf.o
+
+# Test data files
+test_file_*
+data_file_*
+*.dat
+*.bin
+
+# Log files
+*.log
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-*
+
+# CLion specific
+.idea/
+cmake-build-*/
+*.iws
+
+# Python cache (for BCC Python scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Documentation
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# Package files
+*.tar.gz
+*.zip
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+tmp/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Generated files
+generated/
+
+# Profiling data
+*.gcda
+*.gcno
+*.gcov
+gmon.out
+perf.data
+perf.data.old
+
+# Valgrind
+callgrind.out.*
+cachegrind.out.*
+massif.out.*
+
+# Address sanitizer
+*.asan
+
+# Coverage reports
+coverage/
+*.lcov

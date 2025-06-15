@@ -1,0 +1,293 @@
+#!/bin/bash
+
+# eBPF mmap stall demonstration script
+# This script demonstrates monitoring page faults in mmap-backed workloads
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="@CMAKE_CURRENT_BINARY_DIR@"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Default configuration
+FILE_SIZE_MB=128
+ACCESS_COUNT=5000
+PATTERN="random"
+THREADS=2
+MONITOR_INTERVAL=2000
+VERBOSE=""
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo "Run eBPF mmap page fault demonstration"
+    echo
+    echo "Options:"
+    echo "  -s, --size SIZE     Test file size in MB (default: $FILE_SIZE_MB)"
+    echo "  -c, --count COUNT   Access count per thread (default: $ACCESS_COUNT)"
+    echo "  -p, --pattern TYPE  Access pattern: seq, random, stride, mixed (default: $PATTERN)"
+    echo "  -t, --threads NUM   Number of worker threads (default: $THREADS)"
+    echo "  -i, --interval MS   Monitor sample interval in ms (default: $MONITOR_INTERVAL)"
+    echo "  -v, --verbose       Enable verbose output"
+    echo "  -h, --help          Show this help"
+}
+
+log() {
+    echo -e "${GREEN}[DEMO]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This demo requires root privileges to run eBPF programs."
+        error "Please run with sudo: sudo $0"
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    local missing_deps=()
+    
+    # Check for required tools
+    for tool in python3; do
+        if ! command -v $tool &> /dev/null; then
+            missing_deps+=($tool)
+        fi
+    done
+    
+    # Check for BCC Python module
+    if ! python3 -c "import bcc" 2>/dev/null; then
+        missing_deps+=("python3-bcc")
+    fi
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        error "Missing dependencies: ${missing_deps[*]}"
+        error "Please install them and try again."
+        exit 1
+    fi
+}
+
+cleanup() {
+    log "Cleaning up..."
+    
+    # Kill background processes
+    for pid in "${PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+    done
+    
+    # Remove test file
+    if [[ -f "test_data.bin" ]]; then
+        rm -f "test_data.bin"
+        log "Removed test file"
+    fi
+    
+    log "Demo cleanup completed"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -s|--size)
+            FILE_SIZE_MB="$2"
+            shift 2
+            ;;
+        -c|--count)
+            ACCESS_COUNT="$2"
+            shift 2
+            ;;
+        -p|--pattern)
+            PATTERN="$2"
+            shift 2
+            ;;
+        -t|--threads)
+            THREADS="$2"
+            shift 2
+            ;;
+        -i|--interval)
+            MONITOR_INTERVAL="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE="-v"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Array to track background PIDs for cleanup
+declare -a PIDS
+
+# Set up signal handlers
+trap cleanup EXIT
+trap "exit 130" INT
+trap "exit 143" TERM
+
+main() {
+    log "Starting eBPF mmap page fault demonstration"
+    
+    check_root
+    check_dependencies
+    
+    # Change to project directory
+    cd "$PROJECT_ROOT" || exit 1
+    
+    log "Configuration:"
+    info "  File size: ${FILE_SIZE_MB}MB"
+    info "  Access pattern: $PATTERN"
+    info "  Access count per thread: $ACCESS_COUNT"
+    info "  Worker threads: $THREADS"
+    info "  Monitor interval: ${MONITOR_INTERVAL}ms"
+    
+    # Step 1: Generate test data
+    log "Step 1: Generating test data file..."
+    
+    if [[ -f "src/data_generator" ]]; then
+        DATA_GENERATOR="src/data_generator"
+    elif [[ -f "$BUILD_DIR/src/data_generator" ]]; then
+        DATA_GENERATOR="$BUILD_DIR/src/data_generator"
+    else
+        error "Data generator not found. Please build the project first."
+        exit 1
+    fi
+    
+    $DATA_GENERATOR -f test_data.bin -s $FILE_SIZE_MB -p random $VERBOSE
+    if [[ $? -ne 0 ]]; then
+        error "Failed to generate test data"
+        exit 1
+    fi
+    
+    # Step 2: Clear page cache to ensure clean test
+    log "Step 2: Clearing page cache..."
+    sync
+    echo 3 > /proc/sys/vm/drop_caches
+    
+    # Step 3: Start the workload application
+    log "Step 3: Starting mmap workload application..."
+    
+    if [[ -f "src/mmap_workload" ]]; then
+        WORKLOAD_APP="src/mmap_workload"
+    elif [[ -f "$BUILD_DIR/src/mmap_workload" ]]; then
+        WORKLOAD_APP="$BUILD_DIR/src/mmap_workload"
+    else
+        error "Workload application not found. Please build the project first."
+        exit 1
+    fi
+    
+    # Start workload in background with delay to allow monitoring setup
+    (
+        sleep 5  # Give monitor time to start
+        log "Starting workload with PID $$..."
+        $WORKLOAD_APP -f test_data.bin -p $PATTERN -c $ACCESS_COUNT -t $THREADS -d 10 $VERBOSE
+    ) &
+    
+    WORKLOAD_PID=$!
+    PIDS+=($WORKLOAD_PID)
+    
+    # Step 4: Start eBPF monitor
+    log "Step 4: Starting eBPF page fault monitor..."
+    
+    # Choose monitor implementation
+    if [[ -f "tools/pagefault_monitor.py" ]]; then
+        MONITOR="python3 tools/pagefault_monitor.py"
+    elif [[ -f "$BUILD_DIR/tools/pagefault_monitor.py" ]]; then
+        MONITOR="python3 $BUILD_DIR/tools/pagefault_monitor.py"
+    elif [[ -f "src/fault_monitor" ]]; then
+        MONITOR="src/fault_monitor"
+    elif [[ -f "$BUILD_DIR/src/fault_monitor" ]]; then
+        MONITOR="$BUILD_DIR/src/fault_monitor"
+    else
+        error "Monitor application not found. Please build the project first."
+        exit 1
+    fi
+    
+    # Get the actual PID of the workload process
+    sleep 2
+    ACTUAL_WORKLOAD_PID=$(pgrep -f "mmap_workload.*test_data.bin" | head -1)
+    
+    if [[ -n "$ACTUAL_WORKLOAD_PID" ]]; then
+        info "Monitoring workload PID: $ACTUAL_WORKLOAD_PID"
+        MONITOR_ARGS="-p $ACTUAL_WORKLOAD_PID -i $MONITOR_INTERVAL"
+    else
+        warn "Could not determine workload PID, monitoring all processes"
+        MONITOR_ARGS="-i $MONITOR_INTERVAL"
+    fi
+    
+    if [[ -n "$VERBOSE" ]]; then
+        MONITOR_ARGS="$MONITOR_ARGS -v"
+    fi
+    
+    $MONITOR $MONITOR_ARGS &
+    MONITOR_PID=$!
+    PIDS+=($MONITOR_PID)
+    
+    log "Demo is running..."
+    info "Monitor PID: $MONITOR_PID"
+    info "Workload PID: $WORKLOAD_PID"
+    info ""
+    info "The monitor will show real-time page fault statistics."
+    info "Major faults indicate disk I/O due to page misses."
+    info "Minor faults are resolved without disk I/O."
+    info ""
+    info "Press Ctrl+C to stop the demo early."
+    
+    # Wait for workload to complete
+    wait $WORKLOAD_PID
+    WORKLOAD_EXIT_CODE=$?
+    
+    if [[ $WORKLOAD_EXIT_CODE -eq 0 ]]; then
+        log "Workload completed successfully"
+    else
+        warn "Workload exited with code $WORKLOAD_EXIT_CODE"
+    fi
+    
+    # Let monitor run a bit longer to capture final stats
+    sleep 3
+    
+    # Stop monitor
+    if kill -0 "$MONITOR_PID" 2>/dev/null; then
+        kill -INT "$MONITOR_PID" 2>/dev/null
+        wait "$MONITOR_PID" 2>/dev/null
+    fi
+    
+    log "Demo completed!"
+    info ""
+    info "Key observations to look for:"
+    info "1. Major fault count indicates how many pages required disk I/O"
+    info "2. Total fault time shows cumulative I/O wait time per thread"
+    info "3. Average fault time indicates storage latency"
+    info "4. Different access patterns show different fault patterns"
+    info ""
+    info "Try running with different parameters:"
+    info "  - Different access patterns: seq, random, stride, mixed"
+    info "  - Different file sizes to exceed available RAM"
+    info "  - Different thread counts to see concurrency effects"
+}
+
+main "$@"

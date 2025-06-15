@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+eBPF Page Fault Monitor - Python implementation using BCC
+Monitors major page faults in mmap-backed workloads
+"""
+
+import argparse
+import signal
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, Tuple
+import ctypes as ct
+
+from bcc import BPF
+
+@dataclass
+class FaultStats:
+    comm: str = ""
+    total_fault_time_ns: int = 0
+    major_fault_count: int = 0
+    minor_fault_count: int = 0
+    max_fault_time_ns: int = 0
+    min_fault_time_ns: int = 0
+
+# Global state
+running = True
+verbose = False
+thread_stats: Dict[Tuple[int, int], FaultStats] = defaultdict(FaultStats)
+
+# BPF program
+BPF_PROGRAM = """
+#include <uapi/linux/ptrace.h>
+#include <linux/mm.h>
+#include <linux/sched.h>
+
+#define VM_FAULT_MAJOR 0x00000004
+
+struct fault_key_t {
+    u32 pid;
+    u32 tid;
+};
+
+struct fault_data_t {
+    u64 timestamp_ns;
+    u64 total_fault_time_ns;
+    u64 major_fault_count;
+    u64 minor_fault_count;
+    u64 max_fault_time_ns;
+    u64 min_fault_time_ns;
+    char comm[TASK_COMM_LEN];
+};
+
+struct fault_event_t {
+    u32 pid;
+    u32 tid;
+    u64 duration_ns;
+    u8 is_major;
+    char comm[TASK_COMM_LEN];
+};
+
+BPF_HASH(start_times, struct fault_key_t, u64);
+BPF_HASH(fault_stats, struct fault_key_t, struct fault_data_t);
+BPF_PERF_OUTPUT(fault_events);
+BPF_HASH(config, u32, u32);
+
+static inline int should_trace_process(u32 pid) {
+    u32 key = 0;
+    u32 *target_pid = config.lookup(&key);
+    
+    if (!target_pid || *target_pid == 0) {
+        return 1;
+    }
+    
+    return (pid == *target_pid);
+}
+
+int trace_handle_mm_fault_entry(struct pt_regs *ctx, struct mm_struct *mm,
+                                struct vm_area_struct *vma, unsigned long address,
+                                unsigned int flags) {
+    struct fault_key_t key = {};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    
+    key.pid = pid_tgid >> 32;
+    key.tid = (u32)pid_tgid;
+    
+    if (!should_trace_process(key.pid)) {
+        return 0;
+    }
+    
+    u64 timestamp = bpf_ktime_get_ns();
+    start_times.update(&key, &timestamp);
+    
+    return 0;
+}
+
+int trace_handle_mm_fault_exit(struct pt_regs *ctx) {
+    struct fault_key_t key = {};
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    
+    key.pid = pid_tgid >> 32;
+    key.tid = (u32)pid_tgid;
+    
+    if (!should_trace_process(key.pid)) {
+        return 0;
+    }
+    
+    u64 *start_time = start_times.lookup(&key);
+    if (!start_time) {
+        return 0;
+    }
+    
+    u64 end_time = bpf_ktime_get_ns();
+    u64 duration = end_time - *start_time;
+    
+    vm_fault_t ret = PT_REGS_RC(ctx);
+    int is_major = (ret & VM_FAULT_MAJOR) ? 1 : 0;
+    
+    struct fault_data_t *stats = fault_stats.lookup(&key);
+    if (stats) {
+        stats->total_fault_time_ns += duration;
+        if (is_major) {
+            stats->major_fault_count++;
+        } else {
+            stats->minor_fault_count++;
+        }
+        
+        if (duration > stats->max_fault_time_ns) {
+            stats->max_fault_time_ns = duration;
+        }
+        if (stats->min_fault_time_ns == 0 || duration < stats->min_fault_time_ns) {
+            stats->min_fault_time_ns = duration;
+        }
+    } else {
+        struct fault_data_t new_stats = {};
+        new_stats.timestamp_ns = end_time;
+        new_stats.total_fault_time_ns = duration;
+        new_stats.major_fault_count = is_major ? 1 : 0;
+        new_stats.minor_fault_count = is_major ? 0 : 1;
+        new_stats.max_fault_time_ns = duration;
+        new_stats.min_fault_time_ns = duration;
+        bpf_get_current_comm(&new_stats.comm, sizeof(new_stats.comm));
+        
+        fault_stats.update(&key, &new_stats);
+    }
+    
+    // Send real-time event for major faults
+    if (is_major) {
+        struct fault_event_t event = {};
+        event.pid = key.pid;
+        event.tid = key.tid;
+        event.duration_ns = duration;
+        event.is_major = 1;
+        bpf_get_current_comm(&event.comm, sizeof(event.comm));
+        
+        fault_events.perf_submit(ctx, &event, sizeof(event));
+    }
+    
+    start_times.delete(&key);
+    return 0;
+}
+"""
+
+def signal_handler(signum, frame):
+    global running
+    running = False
+
+def handle_fault_event(cpu, data, size):
+    class FaultEvent(ct.Structure):
+        _fields_ = [
+            ("pid", ct.c_uint32),
+            ("tid", ct.c_uint32),
+            ("duration_ns", ct.c_uint64),
+            ("is_major", ct.c_uint8),
+            ("comm", ct.c_char * 16)
+        ]
+    
+    event = ct.cast(data, ct.POINTER(FaultEvent)).contents
+    
+    if verbose:
+        print(f"Major fault: PID={event.pid} TID={event.tid} "
+              f"Duration={event.duration_ns/1000:.1f}μs "
+              f"Comm={event.comm.decode('utf-8', errors='replace')}")
+
+def print_statistics(bpf, clear_screen=True):
+    if clear_screen:
+        print("\033[2J\033[H", end="")  # Clear screen and move cursor to top
+    
+    print("\n=== eBPF Page Fault Monitor (Python) ===")
+    print(f"Sample time: {time.strftime('%H:%M:%S')}")
+    print()
+    
+    # Header
+    print(f"{'PID':>8} {'TID':>8} {'COMM':<16} {'MAJOR':>8} {'MINOR':>8} "
+          f"{'TOTAL_MS':>12} {'AVG_MS':>10} {'MAX_MS':>10} {'MIN_US':>10}")
+    print("-" * 100)
+    
+    total_major = 0
+    total_minor = 0
+    total_time_ms = 0
+    
+    # Get stats from BPF map
+    fault_stats_map = bpf.get_table("fault_stats")
+    
+    for key, value in fault_stats_map.items():
+        if value.major_fault_count == 0 and value.minor_fault_count == 0:
+            continue
+            
+        pid = key.pid
+        tid = key.tid
+        comm = value.comm.decode('utf-8', errors='replace').strip('\x00')
+        
+        major_count = value.major_fault_count
+        minor_count = value.minor_fault_count
+        total_faults = major_count + minor_count
+        
+        total_time_ms_val = value.total_fault_time_ns / 1e6
+        avg_time_ms = total_time_ms_val / total_faults if total_faults > 0 else 0
+        max_time_ms = value.max_fault_time_ns / 1e6
+        min_time_us = value.min_fault_time_ns / 1e3
+        
+        total_major += major_count
+        total_minor += minor_count
+        total_time_ms += total_time_ms_val
+        
+        print(f"{pid:>8} {tid:>8} {comm:<16} {major_count:>8} {minor_count:>8} "
+              f"{total_time_ms_val:>12.2f} {avg_time_ms:>10.3f} {max_time_ms:>10.3f} {min_time_us:>10.1f}")
+    
+    print("-" * 100)
+    print(f"TOTAL: Major={total_major} Minor={total_minor} Time={total_time_ms:.2f}ms")
+    
+    if running:
+        print("\nPress Ctrl+C to stop monitoring...")
+
+def main():
+    global verbose, running
+    
+    parser = argparse.ArgumentParser(
+        description="eBPF-based page fault monitor for mmap workloads"
+    )
+    parser.add_argument("-p", "--pid", type=int, default=0,
+                       help="Target process ID (0 = all processes)")
+    parser.add_argument("-i", "--interval", type=int, default=1000,
+                       help="Sample interval in milliseconds (default: 1000)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                       help="Enable verbose output")
+    
+    args = parser.parse_args()
+    
+    # Check for root privileges
+    import os
+    if os.geteuid() != 0:
+        print("This program requires root privileges to load eBPF programs.")
+        sys.exit(1)
+    
+    verbose = args.verbose
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    print("Initializing eBPF page fault monitor...")
+    
+    try:
+        # Initialize BPF
+        bpf = BPF(text=BPF_PROGRAM)
+        
+        # Set target PID in config map
+        config_map = bpf.get_table("config")
+        config_map[ct.c_uint32(0)] = ct.c_uint32(args.pid)
+        
+        # Attach kprobes
+        bpf.attach_kprobe(event="handle_mm_fault", fn_name="trace_handle_mm_fault_entry")
+        bpf.attach_kretprobe(event="handle_mm_fault", fn_name="trace_handle_mm_fault_exit")
+        
+        # Open perf buffer
+        bpf["fault_events"].open_perf_buffer(handle_fault_event)
+        
+        print("eBPF program loaded and attached successfully.")
+        print(f"Monitoring page faults", end="")
+        if args.pid != 0:
+            print(f" for PID {args.pid}", end="")
+        print("...\n")
+        
+        # Main monitoring loop
+        last_print = time.time()
+        
+        while running:
+            try:
+                bpf.perf_buffer_poll(timeout=100)
+                
+                # Print statistics at intervals
+                now = time.time()
+                if (now - last_print) * 1000 >= args.interval:
+                    print_statistics(bpf)
+                    last_print = now
+                
+            except KeyboardInterrupt:
+                break
+        
+        print("\nDetaching eBPF program...")
+        print("\nFinal Statistics:")
+        print_statistics(bpf, clear_screen=False)
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

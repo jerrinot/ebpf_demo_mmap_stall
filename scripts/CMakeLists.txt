@@ -1,0 +1,28 @@
+# Demo and test scripts
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/run_demo.sh.in
+    ${CMAKE_CURRENT_BINARY_DIR}/run_demo.sh
+    @ONLY
+)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/setup_environment.sh.in
+    ${CMAKE_CURRENT_BINARY_DIR}/setup_environment.sh
+    @ONLY
+)
+
+# Make scripts executable
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/run_demo.sh
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}
+     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+
+file(COPY ${CMAKE_CURRENT_BINARY_DIR}/setup_environment.sh
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR}
+     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+
+# Install scripts
+install(PROGRAMS 
+    ${CMAKE_CURRENT_BINARY_DIR}/run_demo.sh
+    ${CMAKE_CURRENT_BINARY_DIR}/setup_environment.sh
+    DESTINATION bin
+)
