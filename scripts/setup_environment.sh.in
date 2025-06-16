@@ -106,9 +106,10 @@ install_dependencies_ubuntu() {
     # Install BCC and eBPF dependencies
     apt-get install -y bpfcc-tools linux-headers-$(uname -r)
     apt-get install -y python3-bcc libbpf-dev
+
     
     # Install development libraries
-    apt-get install -y pkg-config libbcc-dev
+    apt-get install -y pkg-config libbcc-dev libbpfcc-dev
     
     log "Ubuntu/Debian dependencies installed"
 }
